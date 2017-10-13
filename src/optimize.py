@@ -5,9 +5,14 @@ import tensorflow as tf, numpy as np, os
 import transform
 from utils import get_img
 
-STYLE_LAYERS = ('relu1_1', 'relu2_1', 'relu3_1', 'relu4_1', 'relu5_1')
-CONTENT_LAYER = 'relu4_2'
+from keras import backend as K
+from keras.layers import Lambda
+
+STYLE_LAYERS = ('block1_conv1', 'block2_conv1', 'block3_conv1',
+                'block4_conv1', 'block5_conv1')
+CONTENT_LAYER = 'block4_conv2'
 DEVICES = 'CUDA_VISIBLE_DEVICES'
+
 
 # np arr, np arr
 def optimize(content_targets, style_target, content_weight, style_weight,
@@ -25,13 +30,12 @@ def optimize(content_targets, style_target, content_weight, style_weight,
 
     batch_shape = (batch_size,256,256,3)
     style_shape = (1,) + style_target.shape
-    print(style_shape)
 
     # precompute style features
     with tf.Graph().as_default(), tf.device('/cpu:0'), tf.Session() as sess:
         style_image = tf.placeholder(tf.float32, shape=style_shape, name='style_image')
         style_image_pre = vgg.preprocess(style_image)
-        net = vgg.net(vgg_path, style_image_pre)
+        vgg_net, net = vgg.net(style_image_pre)
         style_pre = np.array([style_target])
         for layer in STYLE_LAYERS:
             features = net[layer].eval(feed_dict={style_image:style_pre})
@@ -40,12 +44,14 @@ def optimize(content_targets, style_target, content_weight, style_weight,
             style_features[layer] = gram
 
     with tf.Graph().as_default(), tf.Session() as sess:
+        K.set_session(sess)
+        K.set_learning_phase(0)
         X_content = tf.placeholder(tf.float32, shape=batch_shape, name="X_content")
         X_pre = vgg.preprocess(X_content)
 
         # precompute content features
         content_features = {}
-        content_net = vgg.net(vgg_path, X_pre)
+        vgg_net, content_net = vgg.net(X_pre)
         content_features[CONTENT_LAYER] = content_net[CONTENT_LAYER]
 
         if slow:
@@ -57,7 +63,7 @@ def optimize(content_targets, style_target, content_weight, style_weight,
             preds = transform.net(X_content/255.0)
             preds_pre = vgg.preprocess(preds)
 
-        net = vgg.net(vgg_path, preds_pre)
+        vgg_net, net = vgg.net(preds_pre)
 
         content_size = _tensor_size(content_features[CONTENT_LAYER])*batch_size
         assert _tensor_size(content_features[CONTENT_LAYER]) == _tensor_size(net[CONTENT_LAYER])
@@ -68,7 +74,7 @@ def optimize(content_targets, style_target, content_weight, style_weight,
         style_losses = []
         for style_layer in STYLE_LAYERS:
             layer = net[style_layer]
-            bs, height, width, filters = map(lambda i:i.value,layer.get_shape())
+            bs, height, width, filters = map(lambda i:i,K.int_shape(layer))
             size = height * width * filters
             feats = tf.reshape(layer, (bs, height * width, filters))
             feats_T = tf.transpose(feats, perm=[0,2,1])
@@ -79,13 +85,15 @@ def optimize(content_targets, style_target, content_weight, style_weight,
         style_loss = style_weight * functools.reduce(tf.add, style_losses) / batch_size
 
         # total variation denoising
-        tv_y_size = _tensor_size(preds[:,1:,:,:])
-        tv_x_size = _tensor_size(preds[:,:,1:,:])
-        y_tv = tf.nn.l2_loss(preds[:,1:,:,:] - preds[:,:batch_shape[1]-1,:,:])
-        x_tv = tf.nn.l2_loss(preds[:,:,1:,:] - preds[:,:,:batch_shape[2]-1,:])
+        _y = Lambda(lambda x : x[:,1:,:,:])(preds)
+        _x = Lambda(lambda x : x[:,:,1:,:])(preds)
+        tv_y_size = _tensor_size(_y)
+        tv_x_size = _tensor_size(_x)
+        y_tv = tf.nn.l2_loss(_y - preds[:,:batch_shape[1]-1,:,:])
+        x_tv = tf.nn.l2_loss(_x - preds[:,:,:batch_shape[2]-1,:])
         tv_loss = tv_weight*2*(x_tv/tv_x_size + y_tv/tv_y_size)/batch_size
 
-        loss = content_loss + style_loss + tv_loss
+        loss = content_loss + style_loss
 
         # overall loss
         train_step = tf.train.AdamOptimizer(learning_rate).minimize(loss)
@@ -139,4 +147,4 @@ def optimize(content_targets, style_target, content_weight, style_weight,
 
 def _tensor_size(tensor):
     from operator import mul
-    return functools.reduce(mul, (d.value for d in tensor.get_shape()[1:]), 1)
+    return functools.reduce(mul, (d for d in K.int_shape(tensor)[1:]), 1)
